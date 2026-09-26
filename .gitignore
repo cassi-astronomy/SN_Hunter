@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.test-cache/
+.cache/
+build/
+dist/
+
+# Local environments and editor settings
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Downloaded catalogue and archival FITS cache
+catalogs/
+archive/
+download-*.fits

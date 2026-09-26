@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sn-hunter"
+version = "0.1.0"
+description = "Visual supernova hunting with WCS-aligned archival images"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "astropy>=5.3",
+    "numpy>=1.23",
+    "PySide6>=6.5",
+    "pyqtgraph>=0.13",
+    "requests>=2.28",
+    "scipy>=1.9",
+]
+
+[project.optional-dependencies]
+reproject = ["reproject>=0.13"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+sn-hunter = "sn_hunter.app:main"
+
+[tool.setuptools.packages.find]
+include = ["sn_hunter*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

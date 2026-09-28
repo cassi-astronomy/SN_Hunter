@@ -1,7 +1,9 @@
+import json
 import os
 import tempfile
 import time
 import warnings
+from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 
@@ -31,6 +33,24 @@ def _votable_bytes(table: Table) -> bytes:
 def test_blink_uses_independent_archive_and_current_stretches():
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
+    assert window.windowTitle() == "SN Hunter 1.0"
+    assert "Page Up" in window.previous_button.text()
+    assert "Page Down" in window.next_button.text()
+    assert window.blink_button.shortcut().toString() == "End"
+    assert window.current_marker_button.isChecked()
+    assert not window.marker_button.isChecked()
+    assert window.current_panel.markers.isVisible()
+    assert not window.reference_panel.markers.isVisible()
+    window.current_marker_button.setChecked(False)
+    assert not window.current_panel.markers.isVisible()
+    assert not window.reference_panel.markers.isVisible()
+    window.current_marker_button.setChecked(True)
+    window.marker_button.setChecked(True)
+    assert window.current_panel.markers.isVisible()
+    assert window.reference_panel.markers.isVisible()
+    window.marker_button.setChecked(False)
+    assert window.current_panel.markers.isVisible()
+    assert not window.reference_panel.markers.isVisible()
     current_raw = np.arange(10000, dtype=float).reshape(100, 100)
     current_cutout = np.linspace(2000.0, 3000.0, 400).reshape(20, 20)
     archive = np.linspace(-5.0, 5.0, 400).reshape(20, 20)
@@ -69,6 +89,19 @@ def test_blink_uses_independent_archive_and_current_stretches():
         statistics_data=current_raw,
     )
     assert np.allclose(window.reference_panel.image_item.image, expected_current)
+
+    with tempfile.TemporaryDirectory() as directory:
+        window.settings = QSettings(
+            str(Path(directory) / "blink.ini"), QSettings.IniFormat
+        )
+        window.blink_button.setEnabled(True)
+        window.blink_button.setChecked(True)
+        window._set_blink(True)
+        assert window.blink_timer.isActive()
+        assert window.blink_button.text() == "Zastavit blink (End)"
+        window.blink_button.setChecked(False)
+        assert not window.blink_timer.isActive()
+        assert window.blink_button.text() == "Spustit blink (End)"
     window.close()
     app.processEvents()
 
@@ -132,6 +165,8 @@ def test_bright_pgc_supplements_hecate_without_duplicates():
     supplemental = next(galaxy for galaxy in galaxies if galaxy.pgc == 101)
     blue_fallback = next(galaxy for galaxy in galaxies if galaxy.pgc == 102)
     assert primary.label == "NGC 123  V=12.3 mag"
+    assert primary.major_arcmin == 4.0
+    assert primary.minor_arcmin == 2.0
     assert supplemental.label == "PGC 101  V≈13.5 mag"
     assert blue_fallback.label == "PGC 102  B≈15.2 mag"
     assert abs(supplemental.major_arcmin - 1.2) < 1e-10
@@ -215,6 +250,48 @@ def test_wide_field_objects_are_not_transformed_into_small_reference_cutout():
     app.processEvents()
 
 
+def test_archive_is_centered_when_galaxy_is_near_current_image_edge():
+    app = QApplication.instance() or QApplication([])
+    wcs = WCS(naxis=2)
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    wcs.wcs.crval = [180.0, 20.0]
+    wcs.wcs.crpix = [500.5, 500.5]
+    wcs.wcs.cd = np.array([[-0.001, 0.0], [0.0, 0.001]])
+    current = FitsImage(np.zeros((1000, 1000)), fits.Header(), wcs)
+    coordinate = current.wcs.pixel_to_world(930.0, 510.0)
+    reference = make_comparison_grid(
+        current, coordinate.ra.degree, coordinate.dec.degree, 8.0, 1.0
+    )
+
+    window = MainWindow()
+    window.current = current
+    window.current_panel.set_wcs(current.wcs)
+    window.current_panel.set_data(current.data)
+    window.reference_panel.set_wcs(reference.wcs)
+    window.reference_panel.set_data(reference.data)
+
+    assert window._focus_coordinate(coordinate, 8.0)
+    # Simulate the archive retaining a previous cutout's view. The current
+    # panel is already centered, so setting its same range again may emit no
+    # signal; explicit two-panel focusing must still repair the archive.
+    window.syncing = True
+    window.reference_panel.view.setRange(
+        xRange=[-800.0, -300.0], yRange=[-700.0, -200.0], padding=0
+    )
+    window.syncing = False
+    assert window._focus_coordinate(coordinate, 8.0)
+
+    for panel in (window.current_panel, window.reference_panel):
+        expected_x, expected_y = panel.wcs.world_to_pixel(coordinate)
+        ranges = panel.view.viewRange()
+        actual_x = (ranges[0][0] + ranges[0][1]) / 2.0
+        actual_y = (ranges[1][0] + ranges[1][1]) / 2.0
+        assert abs(actual_x - expected_x) < 1e-6
+        assert abs(actual_y - expected_y) < 1e-6
+    window.close()
+    app.processEvents()
+
+
 def test_prefetch_runs_for_every_row_and_keeps_displayed_reference():
     app = QApplication.instance() or QApplication([])
     wide_wcs = WCS(naxis=2)
@@ -227,7 +304,7 @@ def test_prefetch_runs_for_every_row_and_keeps_displayed_reference():
     calls = []
 
     def fake_download(galaxy, survey_id, cache_dir, fov_arcmin, pixels=900):
-        calls.append(galaxy.name)
+        calls.append((galaxy.name, fov_arcmin, pixels))
         return wide
 
     original_download = app_module.download_reference
@@ -240,8 +317,8 @@ def test_prefetch_runs_for_every_row_and_keeps_displayed_reference():
         window.reference_panel.set_wcs(wide.wcs)
         window.reference_panel.set_data(shown_reference)
         window.galaxies = [
-            Galaxy("ONE", 180.0, 20.0, 12.0),
-            Galaxy("TWO", 180.1, 20.0, 13.0),
+            Galaxy("ONE", 180.0, 20.0, 12.0, major_arcmin=1.0),
+            Galaxy("TWO", 180.1, 20.0, 13.0, major_arcmin=8.0),
         ]
         window.galaxy_list.addItems([galaxy.label for galaxy in window.galaxies])
         window.galaxy_list.setCurrentRow(0)
@@ -254,15 +331,39 @@ def test_prefetch_runs_for_every_row_and_keeps_displayed_reference():
             app.processEvents()
             time.sleep(0.01)
 
-        assert sorted(calls) == ["ONE", "TWO"]
+        by_name = {name: (fov, pixels) for name, fov, pixels in calls}
+        assert set(by_name) == {"ONE", "TWO"}
+        assert abs(by_name["ONE"][0] - 8.0 * np.sqrt(2.0)) < 1e-9
+        assert abs(by_name["TWO"][0] - 12.0 * np.sqrt(2.0)) < 1e-9
+        assert by_name["TWO"][1] > by_name["ONE"][1]
         assert not window.prefetch_in_progress
         assert window.reference_panel.raw_data is shown_reference
-        window.reference_panel_button.setChecked(False)
-        assert window.reference_panel.isHidden()
+        window.resize(1400, 900)
+        window.show()
+        app.processEvents()
+        window.syncing = True
+        window.current_panel.view.setRange(
+            xRange=[20.0, 80.0], yRange=[20.0, 80.0], padding=0
+        )
+        window.reference_panel.view.setRange(
+            xRange=[15.0, 85.0], yRange=[15.0, 85.0], padding=0
+        )
+        window.syncing = False
+        for _ in range(2):
+            window.reference_panel_button.setChecked(False)
+            app.processEvents()
+            assert window.reference_panel.isHidden()
+            assert window.reference_panel.raw_data is shown_reference
+            window.reference_panel_button.setChecked(True)
+            app.processEvents()
+            assert not window.reference_panel.isHidden()
         assert window.reference_panel.raw_data is shown_reference
-        window.reference_panel_button.setChecked(True)
-        assert not window.reference_panel.isHidden()
-        assert window.reference_panel.raw_data is shown_reference
+        for panel in (window.current_panel, window.reference_panel):
+            ranges = np.asarray(panel.view.viewRange())
+            assert np.all(np.isfinite(ranges))
+            assert 0 < np.ptp(ranges[0]) < 1000
+            assert panel.zoom_percent is not None
+            assert panel.zoom_percent > 0.1
 
         center_x, center_y = wide.wcs.world_to_pixel_values(180.12, 20.08)
         window.current_panel.view.setRange(
@@ -285,6 +386,49 @@ def test_prefetch_runs_for_every_row_and_keeps_displayed_reference():
         app.processEvents()
 
 
+def test_adaptive_reference_size_and_bounded_cache():
+    assert MainWindow._effective_reference_fov(
+        Galaxy("SMALL", 1.0, 2.0, major_arcmin=1.0), 8.0
+    ) == 8.0
+    assert MainWindow._effective_reference_fov(
+        Galaxy("LARGE", 1.0, 2.0, major_arcmin=8.0), 8.0
+    ) == 12.0
+    assert MainWindow._effective_reference_fov(
+        Galaxy("HUGE", 1.0, 2.0, major_arcmin=20.0), 8.0
+    ) == 15.0
+    # NGC 891 has an optical diameter around 12.3', so it must receive the
+    # full automatic 15' cutout rather than the formerly produced ~10'.
+    assert MainWindow._effective_reference_fov(
+        Galaxy("NGC 891", 35.6, 42.35, major_arcmin=12.3), 8.0
+    ) == 15.0
+    assert MainWindow._effective_reference_fov(
+        Galaxy("MANUAL", 1.0, 2.0, major_arcmin=20.0), 20.0
+    ) == 20.0
+    assert MainWindow._effective_reference_fov(
+        Galaxy("UNKNOWN", 1.0, 2.0), 8.0
+    ) == 8.0
+
+    with tempfile.TemporaryDirectory() as directory:
+        cache = Path(directory)
+        oldest = cache / "oldest.fits"
+        newer = cache / "newer.fits"
+        protected = cache / "protected.fits"
+        for path in (oldest, newer, protected):
+            path.write_bytes(b"123456")
+        os.utime(oldest, (1, 1))
+        os.utime(newer, (2, 2))
+        os.utime(protected, (3, 3))
+
+        removed, remaining = services_module.prune_reference_cache(
+            cache, max_bytes=12, protected=protected
+        )
+        assert removed == 1
+        assert remaining == 12
+        assert not oldest.exists()
+        assert newer.exists()
+        assert protected.exists()
+
+
 def test_catalog_result_does_not_zoom_to_first_galaxy():
     app = QApplication.instance() or QApplication([])
     wcs = WCS(naxis=2)
@@ -303,13 +447,90 @@ def test_catalog_result_does_not_zoom_to_first_galaxy():
     )
     before = np.asarray(window.current_panel.view.viewRange())
 
-    window._galaxies_ready([Galaxy("TEST", 180.3, 20.2, 12.0)])
+    window._galaxies_ready(
+        [
+            Galaxy("TEST", 180.3, 20.2, 12.0, major_arcmin=1.0),
+            Galaxy("NEAR", 180.32, 20.2, 13.0, major_arcmin=1.0),
+            Galaxy("FAR", 180.5, 20.2, 14.0, major_arcmin=1.0),
+        ]
+    )
     after = np.asarray(window.current_panel.view.viewRange())
 
-    assert window.galaxy_list.currentRow() == 0
+    assert window.galaxy_list.currentRow() == -1
     assert np.allclose(after, before)
+    assert window.review_groups == [[0, 1], [2]]
+    window._step_galaxy(1)
+    assert window.galaxy_list.currentRow() == 0
+    assert "Výřez 1 / 2" in window.review_position_label.text()
+    assert "2 galaxií" in window.review_position_label.text()
+    window._step_galaxy(1)
+    assert window.galaxy_list.currentRow() == 2
+    assert "Výřez 2 / 2" in window.review_position_label.text()
     window.close()
     app.processEvents()
+
+
+def test_late_manual_catalog_result_cannot_overwrite_a_new_field():
+    app = QApplication.instance() or QApplication([])
+
+    def image_at(ra: float, path: Path) -> FitsImage:
+        wcs = WCS(naxis=2)
+        wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        wcs.wcs.crval = [ra, 20.0]
+        wcs.wcs.crpix = [50.5, 50.5]
+        wcs.wcs.cd = np.array([[-0.01, 0.0], [0.0, 0.01]])
+        return FitsImage(np.zeros((100, 100)), fits.Header(), wcs, path=path)
+
+    window = MainWindow()
+    pending = []
+    original_submit = window._submit
+    window._submit = lambda function, callback, error_callback=None, **_kwargs: pending.append(
+        (function, callback, error_callback)
+    )
+    try:
+        first = image_at(180.0, Path("first.fit"))
+        second = image_at(190.0, Path("second.fit"))
+        window._display_fits_image(first, first.path)
+        window.find_galaxies()
+        assert len(pending) == 2
+
+        window._display_fits_image(second, second.path)
+        entry = app_module.NightField(path=second.path, image=second)
+        window.night_fields = [entry]
+        blocker = QSignalBlocker(window.night_list)
+        window.night_list.addItem(second.path.name)
+        window.night_list.setCurrentRow(0)
+        del blocker
+        pending[0][1]([Galaxy("STALE", 180.0, 20.0, 12.0)])
+        pending[1][1]([
+            DeepSkyObject("STALE DSO", 180.0, 20.0, "OC", "cluster")
+        ])
+        assert window.galaxies == []
+        assert window.deep_sky_objects == []
+        assert window.galaxy_list.count() == 0
+
+        window.find_galaxies()
+        assert len(pending) == 4
+        window._night_progress(
+            (
+                "catalogs",
+                0,
+                [Galaxy("BACKGROUND", 190.0, 20.0, 13.0)],
+                [DeepSkyObject("BACKGROUND DSO", 190.0, 20.0, "OC", "cluster")],
+            )
+        )
+        assert window.galaxies == []
+        assert [galaxy.name for galaxy in entry.galaxies] == ["BACKGROUND"]
+        pending[2][1]([Galaxy("CURRENT", 190.0, 20.0, 12.0)])
+        pending[3][1]([
+            DeepSkyObject("CURRENT DSO", 190.0, 20.0, "OC", "cluster")
+        ])
+        assert [galaxy.name for galaxy in window.galaxies] == ["CURRENT"]
+        assert [item.name for item in window.deep_sky_objects] == ["CURRENT DSO"]
+    finally:
+        window._submit = original_submit
+        window.close()
+        app.processEvents()
 
 
 def test_night_queue_prepares_multiple_fields_in_background():
@@ -401,6 +622,8 @@ def test_display_settings_are_saved_and_restored_with_tenth_percent_steps():
             candidate_wcs,
             path=Path(directory) / "other-field.fit",
         )
+        candidate_image.path.touch()
+        other_image.path.touch()
         window._display_fits_image(candidate_image, candidate_image.path)
         assert window.mag_limit.value() == 17.5
         window.mag_limit.setValue(15.5)
@@ -416,12 +639,12 @@ def test_display_settings_are_saved_and_restored_with_tenth_percent_steps():
         window.resize(1000, 700)
         window.show()
         app.processEvents()
-        previous_button = next(
-            button
-            for button in window.findChildren(app_module.QPushButton)
-            if button.text() == "◀ Předchozí"
+        archive_label = next(
+            label
+            for label in window.findChildren(app_module.QLabel)
+            if label.text() == "Archivní přehlídka"
         )
-        assert window.galaxy_list.geometry().bottom() < previous_button.geometry().top()
+        assert window.galaxy_list.geometry().bottom() < archive_label.geometry().top()
         window.candidate_list_button.setChecked(False)
         assert window.candidate_list_container.isHidden()
         assert len(window.current_panel.candidate_markers.points()) == 1
@@ -519,12 +742,64 @@ def test_display_settings_are_saved_and_restored_with_tenth_percent_steps():
         app.processEvents()
 
 
+def test_candidate_retention_removes_old_and_missing_sources():
+    app = QApplication.instance() or QApplication([])
+    with tempfile.TemporaryDirectory() as directory:
+        directory = Path(directory)
+        settings = QSettings(str(directory / "retention.ini"), QSettings.IniFormat)
+        recent_path = directory / "recent.fit"
+        old_path = directory / "old.fit"
+        missing_path = directory / "missing.fit"
+        recent_path.touch()
+        old_path.touch()
+        now = datetime.now().astimezone()
+        values = [
+            {
+                "field_path": str(recent_path),
+                "ra": 180.0,
+                "dec": 20.0,
+                "created": (now - timedelta(days=2)).isoformat(timespec="seconds"),
+            },
+            {
+                "field_path": str(old_path),
+                "ra": 181.0,
+                "dec": 21.0,
+                "created": (now - timedelta(days=8)).isoformat(timespec="seconds"),
+            },
+            {
+                "field_path": str(missing_path),
+                "ra": 182.0,
+                "dec": 22.0,
+                "created": now.isoformat(timespec="seconds"),
+            },
+        ]
+        settings.setValue("candidates/json", json.dumps(values))
+        settings.sync()
+
+        window = MainWindow()
+        window.settings = settings
+        window._load_candidates()
+        window._refresh_candidate_list()
+        assert len(window.candidates) == 1
+        assert Path(window.candidates[0].field_path) == recent_path
+        assert window.candidate_list.count() == 1
+        saved = json.loads(str(settings.value("candidates/json")))
+        assert len(saved) == 1
+        assert Path(saved[0]["field_path"]) == recent_path
+        window.close()
+        app.processEvents()
+
+
 if __name__ == "__main__":
     test_blink_uses_independent_archive_and_current_stretches()
     test_bright_pgc_supplements_hecate_without_duplicates()
     test_wide_field_objects_are_not_transformed_into_small_reference_cutout()
+    test_archive_is_centered_when_galaxy_is_near_current_image_edge()
     test_prefetch_runs_for_every_row_and_keeps_displayed_reference()
+    test_adaptive_reference_size_and_bounded_cache()
     test_catalog_result_does_not_zoom_to_first_galaxy()
+    test_late_manual_catalog_result_cannot_overwrite_a_new_field()
     test_night_queue_prepares_multiple_fields_in_background()
     test_display_settings_are_saved_and_restored_with_tenth_percent_steps()
+    test_candidate_retention_removes_old_and_missing_sources()
     print("OK: WCS, candidates, DSO, night queue, archive, and display tests")

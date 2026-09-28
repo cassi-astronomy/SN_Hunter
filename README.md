@@ -1,4 +1,4 @@
-# SN Hunter
+# SN Hunter 1.0
 
 Desktopová prohlížečka pro vizuální hledání supernov na FITS snímcích s WCS.
 Aktuální snímek porovnává se zarovnaným archivním výřezem DSS2 nebo Pan-STARRS.
@@ -19,6 +19,9 @@ Aktuální snímek porovnává se zarovnaným archivním výřezem DSS2 nebo Pan
   VizieR,
 - filtrování dostupných magnitud,
 - archivní výřezy přes CDS HiPS2FITS s lokální cache,
+- automatické zvětšení výřezu pro rozměrné galaxie na 1,5násobek jejich
+  katalogového hlavního rozměru, nejvýše na 15′ (ručně zvolená větší hodnota
+  má přednost),
 - hromadné předstažení výřezů pro galaxie vybrané pomocí Ctrl/Shift,
 - archivní výřez ve vlastní jemné WCS mřížce: Pan-STARRS až 0,25″/px a DSS
   přibližně 1″/px (s bezpečnostním limitem velikosti),
@@ -29,7 +32,9 @@ Aktuální snímek porovnává se zarovnaným archivním výřezem DSS2 nebo Pan
   na jeden pixel obrazovky,
 - předvolby zoomu 25–800 %, volné zadání procenta z klávesnice a volba
   **Přizpůsobit** pro celý snímek,
-- žluté kroužky galaxií přímo v obou snímcích a zelené zvýraznění výběru,
+- dva nezávislé přepínače kroužků galaxií v horní liště: v aktuálním snímku
+  jsou standardně zapnuté, v archivním/blink panelu vypnuté, aby nezakrývaly
+  případnou supernovu; oba panely lze samostatně vyčistit nebo označit,
 - samostatně vypínatelná vrstva objektů NGC/IC: zelené mlhoviny, modré
   hvězdokupy a fialové ostatní DSO; typy pocházejí z NGC 2000.0 a polohy
   jsou zpřesněné katalogem VII/239A,
@@ -39,7 +44,7 @@ Aktuální snímek porovnává se zarovnaným archivním výřezem DSS2 nebo Pan
 - výběr galaxie kliknutím na její kroužek,
 - společný křížový kurzor v obou snímcích se souřadnicemi RA/Dec,
 - dynamické úhlové měřítko a krátkou WCS směrovou růžici sever–východ,
-- side-by-side a blink porovnání.
+- side-by-side a blink porovnání,
 - volitelné skrytí archivního panelu; aktuální snímek se roztáhne přes uvolněné
   místo a načtený archiv zůstane zachovaný pro opětovné zobrazení.
 
@@ -65,21 +70,112 @@ Pro kvalitnější a rychlejší reprojekci lze volitelně nainstalovat:
 python -m pip install -e ".[reproject]"
 ```
 
-## Použití
+## Uživatelská příručka
 
-1. Otevřete jeden FITS přes **Otevřít FITS…**, nebo tlačítkem **Přidat snímky
-   noci…** vložte celou sérii polí.
-2. Nastavte limit magnitudy a zvolte **Najít galaxie**.
-3. Vyberte galaxii; oba panely se na ni automaticky přiblíží.
-4. Zvolte přehlídku a velikost výřezu, potom **Načíst podklad**.
-5. Upravte stretch obou panelů nebo zapněte **Blink**.
+SN Hunter je určený především k rychlé vizuální kontrole většího počtu galaxií.
+V levém panelu ukazuje nový pozorovací snímek, v pravém panelu archivní oblohu
+zarovnanou podle WCS. Není tedy nutné ručně otáčet snímek ani hledat shodné
+měřítko. Cílem je všimnout si bodového zdroje, který v archivním snímku není.
 
-Archivní výřez nemusí být navázaný na galaxii. Posuňte nebo přibližte aktuální
-snímek a zvolte **Načíst střed zobrazení**; střed výřezu se vezme z geometrického
-středu právě viditelné oblasti levého panelu.
+Vstupní FITS musí být dvourozměrný a obsahovat platnou WCS astrometrii. Program
+nemění ani nepřepisuje původní FITS soubory.
 
-Pravé kliknutí do kteréhokoli obrazového panelu zkopíruje RA/Dec daného místa
-do schránky ve formátu `08 15 34 +15 35 41`, bez znaků jednotek.
+### Rychlý začátek s jedním polem
+
+1. Otevřete FITS pomocí **Otevřít FITS…**, klávesou `Ctrl+O` nebo přetažením
+   souboru z Průzkumníka do okna.
+2. Upravte stretch levého panelu tak, aby byly viditelné galaxie i slabé bodové
+   zdroje. Pro první pokus je vhodný `asinh`.
+3. Zvolte **Najít galaxie**. Výchozí limit magnitudy se nastaví automaticky
+   podle velikosti zorného pole, ale lze jej ručně změnit.
+4. Klikněte na galaxii v seznamu nebo na její kroužek v levém snímku.
+5. Vyberte archivní přehlídku, obvykle **DSS2 Red**, a zvolte **Načíst
+   podklad**. Pokud byl výřez předstažený, zobrazí se automaticky z cache.
+6. Porovnávejte panely vedle sebe nebo použijte automatický blink v pravém
+   panelu. Tlačítky **Předchozí/Další** postupujte seznamem.
+
+### Obrazové panely
+
+Levý panel obsahuje původní aktuální FITS. Pravý panel obsahuje archivní výřez
+a při blinku střídá archiv se stejnou oblastí aktuálního snímku. Oba panely
+sdílejí nebeský střed a měřítko prostřednictvím WCS.
+
+- Kolečkem myši lze měnit zoom a tažením obraz posouvat.
+- V poli **Zoom** lze vybrat předvolbu, napsat vlastní procento nebo použít
+  **Přizpůsobit**. Hodnota 100 % znamená jeden pixel snímku na jeden pixel
+  obrazovky.
+- **Skrýt archivní panel** uvolní místo pro aktuální snímek. Po opětovném
+  zobrazení zůstane archiv i poloha pohledu zachovaná.
+- Společný kurzor ukazuje stejné nebeské místo v obou panelech. Stavový řádek
+  zobrazuje jeho RA/Dec.
+- Pravé kliknutí do obrazu zkopíruje souřadnice do schránky ve formátu
+  `08 15 34 +15 35 41`.
+- Měřítko a směrová růžice `N`/`E` se počítají z WCS aktuálního panelu.
+
+Pokud výřez u galaxie ležící na kraji původního FITS přesahuje mimo nasnímanou
+oblast, bude chybějící část aktuálního obrazu černá. Archiv je přesto zobrazený
+celý a galaxie zůstane ve středu.
+
+### Stretch, jas a negativ
+
+Každý panel má vlastní typ stretche, černý bod, bílý bod, sílu nebo γ a
+přepínač **Negativ**. Nastavení levého a pravého panelu jsou nezávislá. Program
+si navíc pamatuje samostatné hodnoty pro `asinh`, `linear`, `sqrt`, `log` a
+`power`, takže lze mezi metodami přepínat bez ztráty nastavení.
+
+Při blinku se archivní fáze vykresluje nastavením pravého panelu a aktuální
+fáze nastavením levého panelu. Pokud jas obou fází výrazně skáče, upravte jejich
+černý a bílý bod samostatně. Kroužky galaxií jsou v pravém panelu standardně
+vypnuté, aby nezakryly případnou supernovu.
+
+### Blink a klávesové ovládání
+
+Po načtení archivního podkladu se blink spustí automaticky, pokud nebyl dříve
+vypnutý. Probíhá pouze v pravém panelu, takže vlevo zůstává současně k dispozici
+celý aktuální snímek.
+
+| Akce | Klávesa |
+|---|---|
+| Otevřít FITS | `Ctrl+O` |
+| Předchozí archivní výřez | `Page Up` |
+| Další archivní výřez | `Page Down` |
+| Spustit nebo zastavit blink | `End` |
+
+Horní lišta ukazuje pořadí právě prohlíženého výřezu. Blízké galaxie se v
+navigaci sloučí do jednoho kroku jen tehdy, když se celé bezpečně vejdou do
+společného výřezu. V katalogovém seznamu zůstávají všechny a lze je otevřít
+jednotlivě.
+
+### Katalogové značky
+
+- **Galaxie: aktuální** zapíná značky galaxií v aktuálním snímku.
+- **Galaxie: archiv** zapíná stejné značky v pravém panelu. Standardně
+  jsou vypnuté kvůli nerušenému blinku.
+- **Objekty NGC/IC** zobrazují zeleně mlhoviny, modře hvězdokupy a fialově
+  ostatní objekty hlubokého nebe.
+- Po najetí myší na značku se zobrazí název, dostupná magnituda a u DSO také
+  typ objektu.
+
+Katalogové kroužky jsou orientační pomůcka. Při rozhodování o podezřelém zdroji
+je vhodné je dočasně vypnout, aby jejich obrys nic nezakrýval.
+
+### Oblast bez katalogové galaxie
+
+Archivní výřez nemusí být navázaný na položku seznamu. Posuňte levý snímek tak,
+aby požadovaná oblast ležela uprostřed panelu, a zvolte **Načíst střed
+zobrazení**. Tím lze prověřit libovolnou mlhavou skvrnu nebo podezřelý zdroj.
+
+### Doporučený postup při hledání supernovy
+
+1. Nastavte levý obraz tak, aby nebyla vypálená jádra galaxií a současně byly
+   viditelné slabé hvězdy.
+2. Spusťte blink a sledujte především okolí disku a jádra vybrané galaxie.
+3. Zdroj přítomný jen v aktuální fázi prověřte také s jiným stretchem a bez
+   katalogových kroužků.
+4. Zapněte **Označovat podezřelé body**, kliknutím zdroj uložte a režim zase
+   vypněte. K bodu se lze později vrátit ze seznamu.
+5. Před případným hlášením ověřte, že nejde o kosmický zásah, hotpixel,
+   asteroid, odlesk, stopu družice nebo chybu registrace.
 
 ## Snímky noci
 
@@ -101,7 +197,9 @@ sbalený pod tlačítkem **Seznam podezřelých bodů (N)**, aby nezmenšoval hl
 seznam galaxií. Kliknutí na jeho položku otevře příslušný snímek,
 vycentruje uloženou pozici a rovnou pro ni načte archivní výřez ze zvoleného
 průzkumu (DSS nebo Pan-STARRS). Chybnou značku lze odstranit tlačítkem pod
-seznamem.
+seznamem. Podezřelé body jsou pracovní poznámky pro aktuální pozorovací noc:
+při spuštění se automaticky odstraní body starší než 7 dní a také body, jejichž
+zdrojový FITS soubor už není dostupný.
 
 Více galaxií lze v seznamu označit pomocí Ctrl nebo Shift a tlačítkem
 **Stáhnout označené (N)** předem stáhnout jejich podklady. Tlačítko
@@ -116,7 +214,11 @@ z levého panelu. Percentilové úrovně se počítají z původního FITS.
 
 Internet je potřeba jen pro první katalogový dotaz a první stažení konkrétního
 archivního výřezu. Stažené FITS soubory se ukládají do
-`~/.cache/sn-hunter/archive`.
+`~/.cache/sn-hunter/archive` (ve Windows typicky
+`C:\Users\<uživatel>\.cache\sn-hunter\archive`). Cache archivních FITS je
+omezena na 1 GiB; při spuštění a při překročení limitu aplikace automaticky
+odstraňuje nejdéle nepoužité výřezy. Katalogová cache je oddělená a podstatně
+menší.
 
 ## Poznámky
 
@@ -129,6 +231,10 @@ archivního výřezu. Stažené FITS soubory se ukládají do
   konzervativní mez `B ≤ V limit + 1` a hodnotu označí `B≈`; nevydává ji
   tedy za změřenou V magnitudu. Shody se slučují podle PGC čísla, takže
   nevznikají duplicitní kroužky.
+- Úhlové rozměry galaxií jsou uvnitř programu vedené jako celé průměry.
+  Poloosy `MajAxis`/`MinAxis` z HECATE se při načtení převádějí na průměry;
+  díky tomu dostanou velké galaxie, například NGC 891, dostatečný archivní
+  výřez s okrajem.
 - Výchozí limit galaxií se nastavuje podle WCS rozměru každého pole:
   `17,5 mag` do 2°, `16 mag` mezi 2–5° a `14,5 mag` nad 5°. U aktuálního
   snímku jej lze kdykoli ručně změnit. Noční fronta počítá limit pro každý

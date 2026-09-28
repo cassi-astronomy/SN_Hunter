@@ -6,7 +6,7 @@ import math
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +14,7 @@ from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.wcs.utils import proj_plane_pixel_scales, skycoord_to_pixel
 from PySide6.QtCore import QObject, QSettings, QSignalBlocker, QTimer, Qt, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QStatusBar,
     QToolBar,
@@ -52,9 +53,14 @@ from .services import (
     download_reference,
     query_deep_sky_objects,
     query_galaxies,
+    prune_reference_cache,
     reference_cache_path,
 )
 from .widgets import ImagePanel
+from . import __version__
+
+
+CANDIDATE_RETENTION_DAYS = 7
 
 
 @dataclass
@@ -85,7 +91,7 @@ class FutureBridge(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SN Hunter")
+        self.setWindowTitle(f"SN Hunter {__version__.rsplit('.', 1)[0]}")
         self.resize(1500, 900)
         self.setAcceptDrops(True)
         self.settings = QSettings("SN Hunter", "SN Hunter")
@@ -100,10 +106,14 @@ class MainWindow(QMainWindow):
         self.prefetch_focus_name: str | None = None
         self.loading_reference_key = None
         self.loaded_reference_key = None
+        self.catalog_request_generation = 0
+        self.catalog_request_key = None
         self.night_fields: list[NightField] = []
         self.night_processing = False
         self.candidates: list[Candidate] = []
         self.visible_candidates: list[Candidate] = []
+        self.review_groups: list[list[int]] = []
+        self.review_group_for_row: dict[int, int] = {}
 
         self.current_panel = ImagePanel("Aktuální snímek")
         self.reference_panel = ImagePanel("Archivní podklad")
@@ -157,6 +167,7 @@ class MainWindow(QMainWindow):
         self.fov.setRange(1.0, 120.0)
         self.fov.setValue(8.0)
         self.fov.setSuffix("′")
+        self.fov.valueChanged.connect(self._rebuild_review_groups)
 
         find_button = QPushButton("Najít galaxie")
         find_button.clicked.connect(self.find_galaxies)
@@ -184,19 +195,47 @@ class MainWindow(QMainWindow):
         self.prefetch_button.clicked.connect(self.prefetch_selected)
         self.prefetch_all_button = QPushButton("Stáhnout všechny v seznamu (0)")
         self.prefetch_all_button.clicked.connect(self.prefetch_all)
-        previous_button = QPushButton("◀ Předchozí")
-        previous_button.clicked.connect(lambda: self._step_galaxy(-1))
-        next_button = QPushButton("Další ▶")
-        next_button.clicked.connect(lambda: self._step_galaxy(1))
-        self.blink_button = QPushButton("Blink")
+        self.previous_button = QPushButton("◀ Předchozí (Page Up)")
+        self.previous_button.setShortcut("PgUp")
+        self.previous_button.setToolTip("Předchozí archivní výřez (Page Up)")
+        self.previous_button.setEnabled(False)
+        self.previous_button.clicked.connect(lambda: self._step_galaxy(-1))
+        self.next_button = QPushButton("Další (Page Down) ▶")
+        self.next_button.setShortcut("PgDown")
+        self.next_button.setToolTip("Další archivní výřez (Page Down)")
+        self.next_button.setEnabled(False)
+        self.next_button.clicked.connect(lambda: self._step_galaxy(1))
+        self.review_position_label = QLabel("Výřez — / —")
+        self.review_position_label.setMinimumWidth(150)
+        self.review_position_label.setAlignment(Qt.AlignCenter)
+        self.blink_button = QPushButton()
         self.blink_button.setCheckable(True)
+        self.blink_button.setChecked(
+            self.settings.value("blink/enabled", True, type=bool)
+        )
         self.blink_button.setEnabled(False)
+        self.blink_button.setShortcut(QKeySequence(Qt.Key_End))
+        self.blink_button.setToolTip("Spustit nebo zastavit blink (End)")
         self.blink_button.toggled.connect(self._set_blink)
-        self.marker_button = QPushButton("Kroužky galaxií")
+        self._update_blink_button_text()
+        self.current_marker_button = QPushButton("Galaxie: aktuální")
+        self.current_marker_button.setCheckable(True)
+        self.current_marker_button.setChecked(True)
+        self.current_marker_button.toggled.connect(
+            self.current_panel.set_markers_visible
+        )
+        self.current_marker_button.setToolTip(
+            "Zobrazit kroužky galaxií v aktuálním snímku"
+        )
+        self.marker_button = QPushButton("Galaxie: archiv")
         self.marker_button.setCheckable(True)
-        self.marker_button.setChecked(True)
-        self.marker_button.toggled.connect(self.current_panel.set_markers_visible)
+        self.marker_button.setChecked(False)
         self.marker_button.toggled.connect(self.reference_panel.set_markers_visible)
+        self.marker_button.setToolTip(
+            "Zobrazit kroužky galaxií v archivním/blink panelu"
+        )
+        self.current_panel.set_markers_visible(True)
+        self.reference_panel.set_markers_visible(False)
         self.dso_button = QPushButton("Objekty NGC/IC")
         self.dso_button.setCheckable(True)
         self.dso_button.setChecked(True)
@@ -213,6 +252,7 @@ class MainWindow(QMainWindow):
             self._set_reference_panel_visible
         )
         self.reference_panel_sizes = [700, 700]
+        self.reference_panel_ranges = None
 
         sidebar_content = QWidget()
         side_layout = QVBoxLayout(sidebar_content)
@@ -228,10 +268,6 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(self.mag_limit)
         side_layout.addWidget(find_button)
         side_layout.addWidget(self.galaxy_list, 1)
-        nav = QHBoxLayout()
-        nav.addWidget(previous_button)
-        nav.addWidget(next_button)
-        side_layout.addLayout(nav)
         side_layout.addWidget(QLabel("Archivní přehlídka"))
         side_layout.addWidget(self.survey)
         side_layout.addWidget(QLabel("Velikost výřezu"))
@@ -241,8 +277,6 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(self.prefetch_button)
         side_layout.addWidget(self.prefetch_all_button)
         side_layout.addWidget(QLabel("Více řádků: Ctrl nebo Shift"))
-        side_layout.addWidget(self.blink_button)
-        side_layout.addWidget(self.marker_button)
         side_layout.addWidget(self.dso_button)
         side_layout.addWidget(
             QLabel(
@@ -281,6 +315,16 @@ class MainWindow(QMainWindow):
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self.open_fits)
         toolbar.addAction(open_action)
+        toolbar_spacer = QWidget()
+        toolbar_spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        toolbar.addWidget(toolbar_spacer)
+        toolbar.addWidget(self.previous_button)
+        toolbar.addWidget(self.review_position_label)
+        toolbar.addWidget(self.next_button)
+        toolbar.addSeparator()
+        toolbar.addWidget(self.blink_button)
+        toolbar.addWidget(self.current_marker_button)
+        toolbar.addWidget(self.marker_button)
 
         self.blink_timer = QTimer(self)
         self.blink_timer.setInterval(650)
@@ -301,6 +345,7 @@ class MainWindow(QMainWindow):
         self._set_reference_panel_visible(reference_visible)
         self._load_candidates()
         self._refresh_candidate_list()
+        prune_reference_cache(self.cache_dir)
 
     @property
     def cache_dir(self) -> Path:
@@ -417,6 +462,8 @@ class MainWindow(QMainWindow):
         new_path = path.resolve()
         field_changed = previous_path != new_path
         self.current = image
+        self.catalog_request_generation += 1
+        self.catalog_request_key = None
         if field_changed:
             blocker = QSignalBlocker(self.mag_limit)
             self.mag_limit.setValue(self._default_magnitude_limit(image))
@@ -431,9 +478,10 @@ class MainWindow(QMainWindow):
         self.loading_reference_key = None
         self.loaded_reference_key = None
         self.center_reference_button.setEnabled(True)
-        self.blink_button.setChecked(False)
+        self._suspend_blink()
         self.blink_button.setEnabled(False)
         self.galaxies.clear()
+        self._rebuild_review_groups()
         self.deep_sky_objects.clear()
         self.galaxy_list.clear()
         self.current_panel.set_markers([])
@@ -537,6 +585,27 @@ class MainWindow(QMainWindow):
                 )
         except (TypeError, ValueError, KeyError, json.JSONDecodeError):
             self.candidates = []
+        self._prune_candidates()
+
+    def _prune_candidates(self):
+        now = datetime.now().astimezone()
+        oldest_allowed = now - timedelta(days=CANDIDATE_RETENTION_DAYS)
+        kept = []
+        for candidate in self.candidates:
+            if not Path(candidate.field_path).is_file():
+                continue
+            try:
+                created = datetime.fromisoformat(candidate.created)
+                if created.tzinfo is None:
+                    created = created.astimezone()
+                created = created.astimezone(now.tzinfo)
+            except (TypeError, ValueError):
+                continue
+            if created >= oldest_allowed:
+                kept.append(candidate)
+        if len(kept) != len(self.candidates):
+            self.candidates = kept
+            self._save_candidates()
 
     def _save_candidates(self):
         values = [
@@ -623,18 +692,22 @@ class MainWindow(QMainWindow):
             return
         candidate = self.visible_candidates[row]
         path = Path(candidate.field_path)
+        if not path.is_file():
+            if candidate in self.candidates:
+                self.candidates.remove(candidate)
+            self._save_candidates()
+            self._refresh_candidate_list()
+            self._refresh_candidate_markers()
+            self.statusBar().showMessage(
+                "Podezřelý bod byl odstraněn, protože zdrojový FITS už není dostupný.",
+                10000,
+            )
+            return
         current_matches = (
             self.current is not None
             and self.current.path is not None
             and self.current.path.resolve() == path.resolve()
         )
-        if not current_matches and not path.exists():
-            QMessageBox.warning(
-                self,
-                "Snímek nebyl nalezen",
-                f"Původní FITS soubor už není dostupný:\n{path}",
-            )
-            return
         if not current_matches:
             matching_row = next(
                 (
@@ -766,12 +839,12 @@ class MainWindow(QMainWindow):
 
                     download_errors = 0
                     if prefetch_archives and galaxies:
-                        _, source_fov, source_pixels = self._reference_geometry(
-                            image, galaxies[0], survey_name, requested_fov
-                        )
                         total = len(galaxies)
                         for finished, galaxy in enumerate(galaxies, start=1):
                             try:
+                                _, source_fov, source_pixels = self._reference_geometry(
+                                    image, galaxy, survey_name, requested_fov
+                                )
                                 download_reference(
                                     galaxy,
                                     SURVEYS[survey_name],
@@ -821,7 +894,16 @@ class MainWindow(QMainWindow):
                 entry.image = values[0]
         elif kind == "catalogs":
             entry.galaxies, entry.deep_sky_objects = values
-            if self.night_list.currentRow() == row and self.current is entry.image:
+            manual_catalog_active = (
+                self.catalog_request_key is not None
+                and self.current is not None
+                and self.catalog_request_key[0] == id(self.current)
+            )
+            if (
+                self.night_list.currentRow() == row
+                and self.current is entry.image
+                and not manual_catalog_active
+            ):
                 self._galaxies_ready(entry.galaxies)
                 self._deep_sky_objects_ready(entry.deep_sky_objects)
         elif kind == "download":
@@ -886,22 +968,47 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Nejdříve snímek", "Nejdříve otevřete FITS snímek s WCS.")
             return
         ra, dec, radius = field_center_radius(self.current)
+        magnitude_limit = self.mag_limit.value()
+        self.catalog_request_generation += 1
+        request_key = (id(self.current), self.catalog_request_generation)
+        self.catalog_request_key = request_key
         self.statusBar().showMessage(
             "Dotazuji VizieR na galaxie HECATE + PGC a objekty NGC/IC…"
         )
         self._submit(
             lambda: query_galaxies(
-                ra, dec, radius, self.mag_limit.value(), self.cache_dir.parent
+                ra, dec, radius, magnitude_limit, self.cache_dir.parent
             ),
-            self._galaxies_ready,
+            lambda galaxies: self._manual_galaxies_ready(request_key, galaxies),
+            lambda message: self._manual_catalog_failed(request_key, message),
         )
         self._submit(
             lambda: query_deep_sky_objects(
                 ra, dec, radius, self.cache_dir.parent
             ),
-            self._deep_sky_objects_ready,
-            self._deep_sky_objects_failed,
+            lambda objects: self._manual_deep_sky_objects_ready(
+                request_key, objects
+            ),
+            lambda message: self._manual_deep_sky_objects_failed(
+                request_key, message
+            ),
         )
+
+    def _manual_galaxies_ready(self, request_key, galaxies):
+        if self.catalog_request_key == request_key:
+            self._galaxies_ready(galaxies)
+
+    def _manual_deep_sky_objects_ready(self, request_key, objects):
+        if self.catalog_request_key == request_key:
+            self._deep_sky_objects_ready(objects)
+
+    def _manual_catalog_failed(self, request_key, message: str):
+        if self.catalog_request_key == request_key:
+            self._background_error(message)
+
+    def _manual_deep_sky_objects_failed(self, request_key, message: str):
+        if self.catalog_request_key == request_key:
+            self._deep_sky_objects_failed(message)
 
     def _galaxies_ready(self, galaxies):
         # The TAP query uses a circle enclosing the whole image. Remove objects
@@ -941,16 +1048,13 @@ class MainWindow(QMainWindow):
                 entry.galaxies = list(galaxies)
         self.galaxy_list.clear()
         self.galaxy_list.addItems([galaxy.label for galaxy in galaxies])
+        self._rebuild_review_groups()
         self._update_download_buttons()
         self._refresh_markers()
         self.statusBar().showMessage(f"Nalezeno {len(galaxies)} galaxií.", 8000)
-        if galaxies:
-            # Keep the first result ready for the download button, but do not
-            # treat catalogue loading as a user navigation request.
-            blocker = QSignalBlocker(self.galaxy_list)
-            self.galaxy_list.setCurrentRow(0)
-            del blocker
-            self._update_download_buttons()
+        # Do not preselect row zero. A preselected first row does not emit
+        # currentRowChanged when clicked, which previously made the first
+        # galaxy appear unresponsive until another row had been visited.
 
     def _deep_sky_objects_ready(self, objects):
         if self.current is not None and objects:
@@ -1001,26 +1105,56 @@ class MainWindow(QMainWindow):
 
     def _galaxy_selected(self, row: int):
         if self.current is None or not (0 <= row < len(self.galaxies)):
+            self._update_review_position()
             return
+        self._update_review_position()
         galaxy = self.galaxies[row]
         coordinate = SkyCoord(galaxy.ra, galaxy.dec, unit="deg")
-        if not self._focus_coordinate(coordinate):
+        focus_fov = self._effective_reference_fov(galaxy, self.fov.value())
+        if not self._focus_coordinate(coordinate, focus_fov):
             return
         self.statusBar().showMessage(
             f"{galaxy.label} — RA {galaxy.ra:.6f}°, Dec {galaxy.dec:.6f}°"
         )
         self._autoload_cached_reference(galaxy)
 
-    def _focus_coordinate(self, coordinate: SkyCoord) -> bool:
+    def _focus_coordinate(
+        self, coordinate: SkyCoord, fov_arcmin: float | None = None
+    ) -> bool:
         if self.current is None:
             return False
-        x, y = self.current.wcs.world_to_pixel(coordinate)
-        if not np.isfinite(x) or not np.isfinite(y):
-            return False
-        scale = abs(float(np.mean(proj_plane_pixel_scales(self.current.wcs))))
-        half_width = max(20.0, (self.fov.value() / 60.0) / scale / 2.0)
-        ranges = [[x - half_width, x + half_width], [y - half_width, y + half_width]]
-        self._set_ranges(self.current_panel, ranges)
+        if fov_arcmin is None:
+            fov_arcmin = self.fov.value()
+        panels = [self.current_panel]
+        if self.reference_panel.wcs is not None and self.reference_panel.raw_data is not None:
+            panels.append(self.reference_panel)
+        ranges_by_panel = []
+        for panel in panels:
+            x, y = panel.wcs.world_to_pixel(coordinate)
+            scale = abs(float(np.mean(proj_plane_pixel_scales(panel.wcs))))
+            if (
+                not np.isfinite(x)
+                or not np.isfinite(y)
+                or not np.isfinite(scale)
+                or scale <= 0
+            ):
+                if panel is self.current_panel:
+                    return False
+                continue
+            half_width = max(20.0, (float(fov_arcmin) / 60.0) / scale / 2.0)
+            ranges_by_panel.append(
+                (panel, [[x - half_width, x + half_width], [y - half_width, y + half_width]])
+            )
+        # Set both panels explicitly. Re-applying an unchanged range to the
+        # current panel does not necessarily emit sigRangeChanged, so relying
+        # on range synchronization could leave a newly loaded archive at the
+        # previous cutout's position.
+        self.syncing = True
+        try:
+            for panel, ranges in ranges_by_panel:
+                self._set_ranges(panel, ranges)
+        finally:
+            self.syncing = False
         for panel in (self.current_panel, self.reference_panel):
             if panel.wcs is not None and self._sky_inside_panel(panel, coordinate):
                 px, py = panel.wcs.world_to_pixel(coordinate)
@@ -1093,7 +1227,7 @@ class MainWindow(QMainWindow):
         )
         self.reference_panel.set_data(None)
         self.reference_panel.alternate_data = None
-        self.blink_button.setChecked(False)
+        self._suspend_blink()
         self.blink_button.setEnabled(False)
         if cache_path.exists():
             self.statusBar().showMessage(
@@ -1160,9 +1294,6 @@ class MainWindow(QMainWindow):
         target_image = self.current
         survey_name = self.survey.currentText()
         requested_fov = self.fov.value()
-        _, source_fov, source_pixels = self._reference_geometry(
-            target_image, galaxies[0], survey_name, requested_fov
-        )
         self.prefetch_in_progress = True
         self.prefetch_button.setEnabled(False)
         self.prefetch_all_button.setEnabled(False)
@@ -1176,6 +1307,9 @@ class MainWindow(QMainWindow):
 
             def download(galaxy: Galaxy):
                 report(("started", galaxy.name, True))
+                _, source_fov, source_pixels = self._reference_geometry(
+                    target_image, galaxy, survey_name, requested_fov
+                )
                 download_reference(
                     galaxy,
                     SURVEYS[survey_name],
@@ -1286,10 +1420,16 @@ class MainWindow(QMainWindow):
         )
         self._refresh_markers()
         self.blink_button.setEnabled(True)
-        self._focus_coordinate(SkyCoord(galaxy.ra, galaxy.dec, unit="deg"))
+        if self.blink_button.isChecked():
+            self._set_blink(True)
         pixel_scale = float(np.mean(proj_plane_pixel_scales(comparison_grid.wcs))) * 3600.0
+        visible_fov = comparison_grid.data.shape[1] * pixel_scale / 60.0
+        self._focus_coordinate(
+            SkyCoord(galaxy.ra, galaxy.dec, unit="deg"), visible_fov
+        )
         self.statusBar().showMessage(
-            f"Archiv zachován v jemné mřížce {comparison_grid.data.shape[1]}×"
+            f"Archivní výřez {visible_fov:.1f}′ v jemné mřížce "
+            f"{comparison_grid.data.shape[1]}×"
             f"{comparison_grid.data.shape[0]} px ({pixel_scale:.2f}″/px).",
             10000,
         )
@@ -1307,18 +1447,32 @@ class MainWindow(QMainWindow):
         survey_name: str,
         requested_fov: float,
     ):
+        effective_fov = MainWindow._effective_reference_fov(
+            galaxy, requested_fov
+        )
         comparison_grid = make_comparison_grid(
             target_image,
             galaxy.ra,
             galaxy.dec,
-            requested_fov,
+            effective_fov,
             SURVEY_PIXEL_SCALE_ARCSEC[survey_name],
         )
         source_pixels = min(
             3200,
             int(math.ceil(comparison_grid.data.shape[0] * math.sqrt(2.0))),
         )
-        return comparison_grid, requested_fov * math.sqrt(2.0), source_pixels
+        return comparison_grid, effective_fov * math.sqrt(2.0), source_pixels
+
+    @staticmethod
+    def _effective_reference_fov(galaxy: Galaxy, requested_fov: float) -> float:
+        major = galaxy.major_arcmin
+        if major is None or not np.isfinite(major) or major <= 0:
+            return requested_fov
+        # Keep roughly 25% empty space on each end of the major axis. Automatic
+        # enlargement is capped at 15', while an explicitly larger user value
+        # is always respected.
+        adaptive = min(15.0, float(major) * 1.5)
+        return max(float(requested_fov), adaptive)
 
     def _autoload_cached_reference(self, galaxy: Galaxy, force: bool = False):
         if self.current is None or (self.prefetch_in_progress and not force):
@@ -1382,10 +1536,104 @@ class MainWindow(QMainWindow):
     def _step_galaxy(self, delta: int):
         if not self.galaxies:
             return
-        self.galaxy_list.setCurrentRow((self.galaxy_list.currentRow() + delta) % len(self.galaxies))
+        if not self.review_groups:
+            self._rebuild_review_groups()
+        if not self.review_groups:
+            return
+        row = self.galaxy_list.currentRow()
+        if row < 0:
+            group_index = 0 if delta > 0 else len(self.review_groups) - 1
+        else:
+            current_group = self.review_group_for_row.get(row, 0)
+            group_index = (current_group + delta) % len(self.review_groups)
+        self.galaxy_list.setCurrentRow(self.review_groups[group_index][0])
+
+    def _rebuild_review_groups(self, _value=None):
+        self.review_groups = []
+        self.review_group_for_row = {}
+        if not self.galaxies:
+            if hasattr(self, "previous_button"):
+                self.previous_button.setEnabled(False)
+                self.next_button.setEnabled(False)
+            self._update_review_position()
+            return
+
+        coordinates = SkyCoord(
+            [galaxy.ra for galaxy in self.galaxies],
+            [galaxy.dec for galaxy in self.galaxies],
+            unit="deg",
+        )
+        # Only group a neighbour when its complete catalogued major axis fits
+        # inside the central 70% of the anchor cutout. This leaves 15% of the
+        # cutout on every side as a safety margin for inspection.
+        safe_radius_arcmin = self.fov.value() * 0.35
+        remaining = set(range(len(self.galaxies)))
+        for anchor in range(len(self.galaxies)):
+            if anchor not in remaining:
+                continue
+            group = [anchor]
+            remaining.remove(anchor)
+            separations = coordinates[anchor].separation(coordinates).arcmin
+            for row in sorted(remaining):
+                major = self.galaxies[row].major_arcmin or 0.0
+                if float(separations[row]) + major / 2.0 <= safe_radius_arcmin:
+                    group.append(row)
+            remaining.difference_update(group)
+            group_index = len(self.review_groups)
+            self.review_groups.append(group)
+            for row in group:
+                self.review_group_for_row[row] = group_index
+
+        for group in self.review_groups:
+            names = ", ".join(self.galaxies[row].name for row in group)
+            tip = (
+                f"Jeden bezpečný archivní výřez pokrývá: {names}"
+                if len(group) > 1
+                else names
+            )
+            for row in group:
+                item = self.galaxy_list.item(row)
+                if item is not None:
+                    item.setToolTip(tip)
+        self.previous_button.setEnabled(bool(self.review_groups))
+        self.next_button.setEnabled(bool(self.review_groups))
+        self._update_review_position()
+
+    def _update_review_position(self):
+        total = len(self.review_groups)
+        row = self.galaxy_list.currentRow() if hasattr(self, "galaxy_list") else -1
+        group_index = self.review_group_for_row.get(row)
+        if not total or group_index is None:
+            text = f"Výřez 0 / {total}" if total else "Výřez — / —"
+        else:
+            count = len(self.review_groups[group_index])
+            suffix = f"  ·  {count} galaxií" if count > 1 else ""
+            text = f"Výřez {group_index + 1} / {total}{suffix}"
+        if hasattr(self, "review_position_label"):
+            self.review_position_label.setText(text)
 
     def _sync_range(self, source: ImagePanel, destination: ImagePanel, ranges):
         if self.syncing:
+            return
+        # A hidden view briefly has a zero-sized viewport. Pyqtgraph may emit
+        # an extreme range while the splitter is being relaid out; propagating
+        # that range used to collapse both panels to a displayed zoom of 0 %.
+        if source.isHidden() or destination.isHidden():
+            return
+        view_sizes = (
+            source.view.getViewBox().width(),
+            source.view.getViewBox().height(),
+            destination.view.getViewBox().width(),
+            destination.view.getViewBox().height(),
+        )
+        if any(not np.isfinite(size) or size <= 1.0 for size in view_sizes):
+            return
+        range_array = np.asarray(ranges, dtype=float)
+        if (
+            range_array.shape != (2, 2)
+            or not np.all(np.isfinite(range_array))
+            or np.any(np.abs(range_array[:, 1] - range_array[:, 0]) <= 1e-12)
+        ):
             return
         if (
             source.wcs is None
@@ -1404,6 +1652,15 @@ class MainWindow(QMainWindow):
             dx, dy = destination.wcs.world_to_pixel(coordinate)
             source_scale = float(np.mean(proj_plane_pixel_scales(source.wcs)))
             destination_scale = float(np.mean(proj_plane_pixel_scales(destination.wcs)))
+            if (
+                not np.isfinite(source_scale)
+                or not np.isfinite(destination_scale)
+                or source_scale <= 0
+                or destination_scale <= 0
+                or not np.isfinite(dx)
+                or not np.isfinite(dy)
+            ):
+                return
             ratio = source_scale / destination_scale
             half_width = abs(ranges[0][1] - ranges[0][0]) * ratio / 2.0
             half_height = abs(ranges[1][1] - ranges[1][0]) * ratio / 2.0
@@ -1411,6 +1668,8 @@ class MainWindow(QMainWindow):
                 [dx - half_width, dx + half_width],
                 [dy - half_height, dy + half_height],
             ]
+            if not np.all(np.isfinite(destination_ranges)):
+                return
             self._set_ranges(destination, destination_ranges)
         finally:
             self.syncing = False
@@ -1420,12 +1679,34 @@ class MainWindow(QMainWindow):
         panel.view.setRange(xRange=ranges[0], yRange=ranges[1], padding=0)
 
     def _set_blink(self, enabled: bool):
-        if enabled:
+        self.settings.setValue("blink/enabled", enabled)
+        self._update_blink_button_text()
+        if (
+            enabled
+            and self.blink_button.isEnabled()
+            and self.reference_panel.alternate_data is not None
+        ):
+            if not self.reference_panel.showing_alternate:
+                self.reference_panel.toggle_blink_frame()
             self.blink_timer.start()
         else:
+            self._suspend_blink()
+
+    def _suspend_blink(self):
+        if hasattr(self, "blink_timer"):
             self.blink_timer.stop()
-            self.reference_panel.showing_alternate = False
-            self.reference_panel.refresh()
+        self.reference_panel.showing_alternate = False
+        self.reference_panel.refresh()
+
+    def _update_blink_button_text(self):
+        self.blink_button.setText(
+            "Zastavit blink (End)"
+            if self.blink_button.isChecked()
+            else "Spustit blink (End)"
+        )
+        # QPushButton.setText() clears its explicit shortcut in Qt/PySide6.
+        # Reapply it whenever the dynamic label changes.
+        self.blink_button.setShortcut(QKeySequence(Qt.Key_End))
 
     def _cursor_moved(self, source: ImagePanel, x: float, y: float):
         if self.current is None:
@@ -1592,19 +1873,63 @@ class MainWindow(QMainWindow):
             self.reference_panel.show_cursor(0, 0, False)
 
     def _set_reference_panel_visible(self, visible: bool):
+        current_ranges = self.current_panel.view.viewRange()
+        reference_ranges = self.reference_panel.view.viewRange()
         if visible:
-            self.reference_panel.show()
-            if hasattr(self, "images_splitter"):
-                self.images_splitter.setSizes(self.reference_panel_sizes)
+            restore_ranges = self.reference_panel_ranges or (
+                current_ranges,
+                reference_ranges,
+            )
+            self.syncing = True
+            try:
+                self.reference_panel.show()
+                if hasattr(self, "images_splitter"):
+                    sizes = self.reference_panel_sizes
+                    if len(sizes) != 2 or min(sizes) <= 0:
+                        sizes = [700, 700]
+                    self.images_splitter.setSizes(sizes)
+            finally:
+                self.syncing = False
             self.reference_panel_button.setText("Skrýt archivní panel")
         else:
+            self.reference_panel_ranges = (current_ranges, reference_ranges)
             if hasattr(self, "images_splitter") and not self.reference_panel.isHidden():
                 sizes = self.images_splitter.sizes()
-                if len(sizes) == 2 and sizes[1] > 0:
+                if len(sizes) == 2 and min(sizes) > 0:
                     self.reference_panel_sizes = sizes
-            self.reference_panel.hide()
+            restore_ranges = self.reference_panel_ranges
+            self.syncing = True
+            try:
+                self.reference_panel.hide()
+            finally:
+                self.syncing = False
             self.reference_panel_button.setText("Zobrazit archivní panel")
+        if self.current_panel.raw_data is not None:
+            # Wait until QSplitter has assigned the final viewport sizes, then
+            # restore the astronomical ranges without cross-panel feedback.
+            QTimer.singleShot(
+                0,
+                lambda ranges=restore_ranges: self._restore_panel_ranges(ranges),
+            )
         self.settings.setValue("layout/reference_panel_visible", visible)
+
+    def _restore_panel_ranges(self, ranges):
+        if not ranges:
+            return
+        current_ranges, reference_ranges = ranges
+        arrays = [
+            np.asarray(current_ranges, dtype=float),
+            np.asarray(reference_ranges, dtype=float),
+        ]
+        if any(array.shape != (2, 2) or not np.all(np.isfinite(array)) for array in arrays):
+            return
+        self.syncing = True
+        try:
+            self._set_ranges(self.current_panel, current_ranges)
+            if self.reference_panel.raw_data is not None:
+                self._set_ranges(self.reference_panel, reference_ranges)
+        finally:
+            self.syncing = False
 
     def closeEvent(self, event):
         self._save_candidates()
@@ -1618,6 +1943,7 @@ class MainWindow(QMainWindow):
 def main() -> int:
     pg_app = QApplication.instance() or QApplication(sys.argv)
     pg_app.setApplicationName("SN Hunter")
+    pg_app.setApplicationVersion(__version__)
     window = MainWindow()
     window.show()
     return pg_app.exec()

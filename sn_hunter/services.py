@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import tempfile
+import threading
 from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,8 @@ SURVEY_PIXEL_SCALE_ARCSEC = {
     "DSS2 IR": 1.0,
     "Pan-STARRS DR1 r": 0.25,
 }
+REFERENCE_CACHE_MAX_BYTES = 1 * 1024**3
+_REFERENCE_CACHE_LOCK = threading.RLock()
 
 
 def _write_cache_atomic(path: Path, content: bytes):
@@ -55,6 +58,8 @@ class Galaxy:
     ra: float
     dec: float
     magnitude: float | None = None
+    # Full angular diameters. HECATE's MajAxis/MinAxis values are semi-axes
+    # and are converted while parsing; HyperLEDA logD25 is already a diameter.
     major_arcmin: float | None = None
     minor_arcmin: float | None = None
     position_angle_deg: float | None = None
@@ -208,8 +213,12 @@ def query_galaxies(
             pgc = int(pgc_col[index])
         if not name and pgc is not None:
             name = f"PGC {pgc}"
-        major = _optional_float(major_col, index)
-        minor = _optional_float(minor_col, index)
+        # VizieR's Axis convention and HECATE use angular semi-axes. Keep one
+        # unambiguous representation in the application: full diameters.
+        major_axis = _optional_float(major_col, index)
+        minor_axis = _optional_float(minor_col, index)
+        major = None if major_axis is None else 2.0 * major_axis
+        minor = None if minor_axis is None else 2.0 * minor_axis
         pa = _optional_float(pa_col, index)
         name = re.sub(r"^(NGC|IC|UGC|PGC|M)(\d)", r"\1 \2", name)
         result.append(
@@ -644,13 +653,18 @@ def download_reference(
     cache_dir.mkdir(parents=True, exist_ok=True)
     params = _reference_params(galaxy, survey_id, fov_arcmin, pixels)
     path = reference_cache_path(galaxy, survey_id, cache_dir, fov_arcmin, pixels)
-    if path.exists():
-        try:
-            return _read_reference_fits(path)
-        except Exception:
-            # A previous interrupted or concurrent download may have left an
-            # invalid cache entry. It is safe to replace this derived file.
-            path.unlink(missing_ok=True)
+    with _REFERENCE_CACHE_LOCK:
+        prune_reference_cache(cache_dir, protected=path)
+        if path.exists():
+            try:
+                image = _read_reference_fits(path)
+                # mtime acts as a simple last-used timestamp for cache eviction.
+                path.touch()
+                return image
+            except Exception:
+                # A previous interrupted download may have left an invalid
+                # cache entry. It is safe to replace this derived file.
+                path.unlink(missing_ok=True)
 
     response = requests.get(HIPS2FITS_URL, params=params, timeout=90)
     response.raise_for_status()
@@ -665,12 +679,53 @@ def download_reference(
         ) as temporary:
             temporary.write(response.content)
             temporary_path = Path(temporary.name)
-        # Atomic replace prevents another worker from seeing a half-written FITS.
-        temporary_path.replace(path)
+        # Keep replacement, pruning and the first read in one critical section.
+        # Otherwise the other prefetch worker could evict this file between
+        # replacement and reading it.
+        with _REFERENCE_CACHE_LOCK:
+            temporary_path.replace(path)
+            temporary_path = None
+            prune_reference_cache(cache_dir, protected=path)
+            return _read_reference_fits(path)
     finally:
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink(missing_ok=True)
-    return _read_reference_fits(path)
+
+
+def prune_reference_cache(
+    cache_dir: Path,
+    max_bytes: int = REFERENCE_CACHE_MAX_BYTES,
+    protected: Path | None = None,
+) -> tuple[int, int]:
+    """Keep derived archive FITS files within a bounded least-recently-used cache."""
+    with _REFERENCE_CACHE_LOCK:
+        if not cache_dir.exists():
+            return 0, 0
+        entries: list[tuple[float, int, Path]] = []
+        total = 0
+        for path in cache_dir.glob("*.fits"):
+            if path.name.startswith("download-"):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            total += stat.st_size
+            entries.append((stat.st_mtime, stat.st_size, path))
+        removed = 0
+        protected_resolved = protected.resolve() if protected is not None else None
+        for _mtime, size, path in sorted(entries):
+            if total <= max_bytes:
+                break
+            if protected_resolved is not None and path.resolve() == protected_resolved:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            total -= size
+            removed += 1
+        return removed, total
 
 
 def _reference_params(
